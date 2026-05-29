@@ -1,0 +1,617 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Minecraft Coordinate Grid</title>
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: white;
+      color: black;
+      overflow: hidden;
+    }
+
+    #app {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      height: 100vh;
+    }
+
+    #sidebar {
+      border-right: 1px solid black;
+      padding: 16px;
+      overflow-y: auto;
+    }
+
+    h1 { font-size: 20px; margin: 0 0 16px; }
+
+    label {
+      display: block;
+      margin-top: 10px;
+      font-size: 14px;
+    }
+
+    input, button {
+      width: 100%;
+      padding: 8px;
+      margin-top: 4px;
+      border: 1px solid black;
+      background: white;
+      color: black;
+      font-size: 14px;
+    }
+
+    button {
+      cursor: pointer;
+      margin-top: 12px;
+    }
+
+    button:hover {
+      background: black;
+      color: white;
+    }
+
+    #info {
+      margin: 16px 0;
+      padding: 8px;
+      border: 1px solid black;
+      font-size: 14px;
+      line-height: 1.5;
+    }
+
+    #pointsList {
+      margin-top: 8px;
+      font-size: 13px;
+    }
+
+    .point-row {
+      border-top: 1px solid black;
+      padding: 8px 0;
+    }
+
+    .point-row strong { display: block; }
+
+    .small-button {
+      padding: 4px 6px;
+      font-size: 12px;
+      margin-top: 6px;
+    }
+
+    #mapWrap {
+      position: relative;
+      overflow: hidden;
+    }
+
+    #mapCanvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+    }
+
+    #mapCanvas.dragging { cursor: grabbing; }
+
+    #help {
+      position: absolute;
+      left: 12px;
+      bottom: 12px;
+      background: white;
+      border: 1px solid black;
+      padding: 8px;
+      font-size: 12px;
+      line-height: 1.5;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <h1>Minecraft Grid Map</h1>
+
+      <form id="pointForm">
+        <label>
+          Name
+          <input id="nameInput" type="text" placeholder="Home base" required />
+        </label>
+
+        <label>
+          X
+          <input id="xInput" type="number" step="1" required />
+        </label>
+
+        <label>
+          Y
+          <input id="yInput" type="number" step="1" required />
+        </label>
+
+        <label>
+          Z
+          <input id="zInput" type="number" step="1" required />
+        </label>
+
+        <button type="submit">Add Point</button>
+      </form>
+
+      <div id="info"></div>
+
+      <button id="exportButton" type="button">Export JSON</button>
+      <button id="clearButton" type="button">Clear All Points</button>
+      <button id="resetViewButton" type="button">Reset View</button>
+
+      <div id="savedPointsSection">
+        <h2 style="font-size:16px; margin-bottom:8px;">Saved Points</h2>
+        <input
+          id="filterInput"
+          type="text"
+          placeholder="Search saved points"
+          style="width:100%; padding:8px; border:1px solid black; margin-bottom:12px;"
+        />
+        <div id="pointsList"></div>
+      </div>
+    </aside>
+
+    <main id="mapWrap">
+      <canvas id="mapCanvas"></canvas>
+      <div id="help">
+        Mouse wheel: zoom<br />
+        Shift + mouse wheel: change Y layer<br />
+        Drag: move map<br />
+        Click label: focus point
+      </div>
+    </main>
+  </div>
+
+  <script>
+    /*
+     * Copyright 2026 Masaki Fujimoto
+     *
+     * Licensed under the Apache License, Version 2.0 (the "License");
+     * you may not use this file except in compliance with the License.
+     * You may obtain a copy of the License at
+     *
+     *     https://www.apache.org/licenses/LICENSE-2.0
+     *
+     * Unless required by applicable law or agreed to in writing, software
+     * distributed under the License is distributed on an "AS IS" BASIS,
+     * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+     */
+
+    const STORAGE_KEY = 'minecraft-grid-map-points-v1';
+
+    const canvas = document.getElementById('mapCanvas');
+    const ctx = canvas.getContext('2d');
+    const form = document.getElementById('pointForm');
+    const nameInput = document.getElementById('nameInput');
+    const xInput = document.getElementById('xInput');
+    const yInput = document.getElementById('yInput');
+    const zInput = document.getElementById('zInput');
+    const info = document.getElementById('info');
+    const filterInput = document.getElementById('filterInput');
+    const pointsList = document.getElementById('pointsList');
+    const exportButton = document.getElementById('exportButton');
+    const clearButton = document.getElementById('clearButton');
+    const resetViewButton = document.getElementById('resetViewButton');
+
+    let points = loadPoints();
+    let currentY = points.length ? points[points.length - 1].y : 64;
+
+    let zoom = 4;
+    let panX = 0;
+    let panY = 0;
+
+    let dragging = false;
+    let didDrag = false;
+    let lastMouseX = 0;
+    let lastMouseY = 0;
+
+    let filterText = '';
+    let labelHitBoxes = [];
+
+    function loadPoints() {
+      try {
+        return JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
+      } catch (error) {
+        return [];
+      }
+    }
+
+    function savePoints() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(points));
+    }
+
+    function resizeCanvas() {
+      const rect = canvas.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+
+      canvas.width = Math.floor(rect.width * dpr);
+      canvas.height = Math.floor(rect.height * dpr);
+
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      draw();
+    }
+
+    function worldToScreen(x, z) {
+      return {
+        x: canvas.clientWidth / 2 + panX + x * zoom,
+        y: canvas.clientHeight / 2 + panY + z * zoom
+      };
+    }
+
+    function screenToWorld(screenX, screenY) {
+      return {
+        x: (screenX - canvas.clientWidth / 2 - panX) / zoom,
+        z: (screenY - canvas.clientHeight / 2 - panY) / zoom
+      };
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      drawGrid();
+      drawAxes();
+      drawPoints();
+      renderInfo();
+      renderPointsList();
+    }
+
+    function drawGrid() {
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+
+      let gridStep = zoom;
+      while (gridStep < 20) gridStep *= 2;
+      while (gridStep > 80) gridStep /= 2;
+
+      const topLeft = screenToWorld(0, 0);
+      const bottomRight = screenToWorld(width, height);
+      const blockStep = gridStep / zoom;
+
+      const startX = Math.floor(topLeft.x / blockStep) * blockStep;
+      const endX = Math.ceil(bottomRight.x / blockStep) * blockStep;
+      const startZ = Math.floor(topLeft.z / blockStep) * blockStep;
+      const endZ = Math.ceil(bottomRight.z / blockStep) * blockStep;
+
+      ctx.beginPath();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = 'black';
+      ctx.globalAlpha = 0.2;
+
+      for (let x = startX; x <= endX; x += blockStep) {
+        const pos = worldToScreen(x, 0);
+        ctx.moveTo(pos.x, 0);
+        ctx.lineTo(pos.x, height);
+      }
+
+      for (let z = startZ; z <= endZ; z += blockStep) {
+        const pos = worldToScreen(0, z);
+        ctx.moveTo(0, pos.y);
+        ctx.lineTo(width, pos.y);
+      }
+
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+    }
+
+    function drawAxes() {
+      const origin = worldToScreen(0, 0);
+
+      ctx.beginPath();
+      ctx.lineWidth = 1;
+      ctx.strokeStyle = 'black';
+
+      ctx.moveTo(origin.x, 0);
+      ctx.lineTo(origin.x, canvas.clientHeight);
+
+      ctx.moveTo(0, origin.y);
+      ctx.lineTo(canvas.clientWidth, origin.y);
+
+      ctx.stroke();
+
+      ctx.fillStyle = 'black';
+      ctx.font = '12px Arial';
+      ctx.fillText('X', canvas.clientWidth - 20, origin.y - 6);
+      ctx.fillText('Z', origin.x + 6, canvas.clientHeight - 12);
+      ctx.fillText('0,0', origin.x + 6, origin.y - 6);
+    }
+
+    function getFilteredPoints() {
+      const query = filterText.trim().toLowerCase();
+      if (!query) return points;
+      return points.filter(point => point.name.toLowerCase().includes(query));
+    }
+
+    function getGrayForYDistance(pointY) {
+      const distance = Math.abs(pointY - currentY);
+      const maxUsefulDistance = 80;
+      const t = Math.min(distance / maxUsefulDistance, 1);
+
+      const gray = Math.round(70 + t * 110);
+      return `rgb(${gray}, ${gray}, ${gray})`;
+    }
+
+    function addLabelHitBox(point, text, x, y) {
+      const textWidth = ctx.measureText(text).width;
+
+      labelHitBoxes.push({
+        point,
+        x,
+        y: y - 13,
+        width: textWidth,
+        height: 16
+      });
+    }
+
+    function drawPoints() {
+      labelHitBoxes = [];
+
+      const filteredPoints = getFilteredPoints();
+      const otherPoints = filteredPoints.filter(point => point.y !== currentY);
+      const currentLayerPoints = filteredPoints.filter(point => point.y === currentY);
+
+      ctx.font = '13px Arial';
+
+      for (const point of otherPoints) {
+        const pos = worldToScreen(point.x, point.z);
+        const gray = getGrayForYDistance(point.y);
+
+        ctx.fillStyle = gray;
+        ctx.strokeStyle = gray;
+
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+
+        const labelX = pos.x + 8;
+        const labelY = pos.y - 8;
+
+        ctx.fillText(point.name, labelX, labelY);
+        addLabelHitBox(point, point.name, labelX, labelY);
+      }
+
+      ctx.fillStyle = 'black';
+      ctx.strokeStyle = 'black';
+
+      for (const point of currentLayerPoints) {
+        const pos = worldToScreen(point.x, point.z);
+
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, 5, 0, Math.PI * 2);
+        ctx.fill();
+
+        const labelX = pos.x + 8;
+        const labelY = pos.y - 8;
+
+        ctx.fillText(point.name, labelX, labelY);
+        ctx.fillText(`(${point.x}, ${point.y}, ${point.z})`, pos.x + 8, pos.y + 8);
+
+        addLabelHitBox(point, point.name, labelX, labelY);
+      }
+    }
+
+    function renderInfo() {
+      const filteredPoints = getFilteredPoints();
+      const visibleCount = filteredPoints.filter(point => point.y === currentY).length;
+
+      info.innerHTML = `
+        Current Y layer: <strong>${currentY}</strong><br>
+        Zoom: <strong>${zoom.toFixed(2)} px/block</strong><br>
+        Matching points on this layer: <strong>${visibleCount}</strong><br>
+        Matching saved points: <strong>${filteredPoints.length}</strong><br>
+        Total saved points: <strong>${points.length}</strong>
+      `;
+    }
+
+    function renderPointsList() {
+      const filteredPoints = getFilteredPoints();
+
+      if (!points.length) {
+        pointsList.innerHTML = '<p>No points saved yet.</p>';
+        return;
+      }
+
+      if (!filteredPoints.length) {
+        pointsList.innerHTML = '<p>No matching points found.</p>';
+        return;
+      }
+
+      pointsList.innerHTML = filteredPoints
+        .map((point) => {
+          const index = points.indexOf(point);
+          return `
+            <div class="point-row">
+              <strong>${escapeHtml(point.name)}</strong>
+              X: ${point.x}, Y: ${point.y}, Z: ${point.z}
+              <button class="small-button" type="button" onclick="jumpToPoint(${index})">Jump</button>
+              <button class="small-button" type="button" onclick="deletePoint(${index})">Delete</button>
+            </div>
+          `;
+        })
+        .join('');
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+    }
+
+    function focusPoint(point) {
+      currentY = point.y;
+      panX = -point.x * zoom;
+      panY = -point.z * zoom;
+      draw();
+    }
+
+    function findLabelHit(mouseX, mouseY) {
+      return labelHitBoxes.find(box =>
+        mouseX >= box.x &&
+        mouseX <= box.x + box.width &&
+        mouseY >= box.y &&
+        mouseY <= box.y + box.height
+      );
+    }
+
+    form.addEventListener('submit', event => {
+      event.preventDefault();
+
+      const point = {
+        name: nameInput.value.trim(),
+        x: Number(xInput.value),
+        y: Number(yInput.value),
+        z: Number(zInput.value)
+      };
+
+      if (!point.name || !Number.isFinite(point.x) || !Number.isFinite(point.y) || !Number.isFinite(point.z)) {
+        return;
+      }
+
+      points.push(point);
+      currentY = point.y;
+      savePoints();
+
+      nameInput.value = '';
+      xInput.value = '';
+      yInput.value = '';
+      zInput.value = '';
+      nameInput.focus();
+
+      focusPoint(point);
+    });
+
+    exportButton.addEventListener('click', () => {
+      const data = JSON.stringify(points, null, 2);
+      const blob = new Blob([data], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+
+      const date = new Date().toISOString().slice(0, 10);
+      link.href = url;
+      link.download = `minecraft-coordinates-${date}.json`;
+      link.click();
+
+      URL.revokeObjectURL(url);
+    });
+
+    clearButton.addEventListener('click', () => {
+      if (!confirm('Delete all saved points?')) return;
+      points = [];
+      savePoints();
+      draw();
+    });
+
+    resetViewButton.addEventListener('click', () => {
+      zoom = 4;
+      panX = 0;
+      panY = 0;
+      draw();
+    });
+
+    filterInput.addEventListener('input', () => {
+      filterText = filterInput.value;
+      draw();
+    });
+
+    canvas.addEventListener('wheel', event => {
+      event.preventDefault();
+
+      if (event.shiftKey) {
+        const wheelDelta = Math.abs(event.deltaY) >= Math.abs(event.deltaX)
+          ? event.deltaY
+          : event.deltaX;
+
+        currentY += wheelDelta < 0 ? 1 : -1;
+        draw();
+        return;
+      }
+
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = event.clientX - rect.left;
+      const mouseY = event.clientY - rect.top;
+      const beforeZoom = screenToWorld(mouseX, mouseY);
+
+      const zoomFactor = event.deltaY < 0 ? 1.15 : 1 / 1.15;
+      zoom = Math.max(0.25, Math.min(100, zoom * zoomFactor));
+
+      const afterZoom = screenToWorld(mouseX, mouseY);
+      panX += (afterZoom.x - beforeZoom.x) * zoom;
+      panY += (afterZoom.z - beforeZoom.z) * zoom;
+
+      draw();
+    }, { passive: false });
+
+    canvas.addEventListener('mousedown', event => {
+      dragging = true;
+      didDrag = false;
+      lastMouseX = event.clientX;
+      lastMouseY = event.clientY;
+      canvas.classList.add('dragging');
+    });
+
+    window.addEventListener('mousemove', event => {
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = event.clientX - rect.left;
+      const mouseY = event.clientY - rect.top;
+
+      if (dragging) {
+        const moveX = event.clientX - lastMouseX;
+        const moveY = event.clientY - lastMouseY;
+
+        if (Math.abs(moveX) > 2 || Math.abs(moveY) > 2) {
+          didDrag = true;
+        }
+
+        panX += moveX;
+        panY += moveY;
+        lastMouseX = event.clientX;
+        lastMouseY = event.clientY;
+
+        draw();
+        return;
+      }
+
+      const hoveringLabel = findLabelHit(mouseX, mouseY);
+      canvas.style.cursor = hoveringLabel ? 'pointer' : 'grab';
+    });
+
+    window.addEventListener('mouseup', () => {
+      dragging = false;
+      canvas.classList.remove('dragging');
+    });
+
+    canvas.addEventListener('click', event => {
+      if (didDrag) return;
+
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = event.clientX - rect.left;
+      const mouseY = event.clientY - rect.top;
+
+      const hit = findLabelHit(mouseX, mouseY);
+      if (!hit) return;
+
+      focusPoint(hit.point);
+    });
+
+    window.jumpToPoint = function(index) {
+      const point = points[index];
+      if (!point) return;
+      focusPoint(point);
+    };
+
+    window.deletePoint = function(index) {
+      points.splice(index, 1);
+      savePoints();
+      draw();
+    };
+
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+  </script>
+</body>
+</html>
